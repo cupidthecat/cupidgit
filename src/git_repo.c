@@ -28,9 +28,9 @@ char* find_git_directory(const char *path) {
     // Walk up directory tree
     while (1) {
         // Check for .git in current directory
-        snprintf(git_path, sizeof(git_path), "%s/.git", current);
+        if (snprintf(git_path, sizeof(git_path), "%s/.git", current) >= (int)sizeof(git_path)) return NULL;
 
-        if (stat(git_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (stat(git_path, &st) == 0 && (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))) {
             return strdup(current);  // Found repo root
         }
 
@@ -92,8 +92,43 @@ GitRepository* git_repo_open(const char *path) {
     }
 
     repo->repo_root = repo_root;
+    size_t git_len = strlen(repo_root) + 6;
+    repo->git_dir = malloc(git_len);
+    if (!repo->git_dir) { git_repo_free(repo); return NULL; }
+    snprintf(repo->git_dir, git_len, "%s/.git", repo_root);
+    struct stat st;
+    if (stat(repo->git_dir, &st) != 0) { git_repo_free(repo); return NULL; }
+    if (S_ISREG(st.st_mode)) {
+        FILE *fp = fopen(repo->git_dir, "r");
+        char *line = NULL;
+        size_t cap = 0;
+        ssize_t len = fp ? getline(&line, &cap, fp) : -1;
+        if (fp) fclose(fp);
+        if (len < 9 || strncmp(line, "gitdir: ", 8) != 0) {
+            free(line); git_repo_free(repo); return NULL;
+        }
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
+        char *target = NULL;
+        if (line[8] == '/') target = strdup(line + 8);
+        else {
+            size_t n = strlen(repo_root) + strlen(line + 8) + 2;
+            target = malloc(n);
+            if (target) snprintf(target, n, "%s/%s", repo_root, line + 8);
+        }
+        free(line);
+        free(repo->git_dir);
+        repo->git_dir = target ? realpath(target, NULL) : NULL;
+        free(target);
+        if (!repo->git_dir) { git_repo_free(repo); return NULL; }
+    }
+    size_t head_len = strlen(repo->git_dir) + 6;
+    char *head = malloc(head_len);
+    if (!head) { git_repo_free(repo); return NULL; }
+    snprintf(head, head_len, "%s/HEAD", repo->git_dir);
+    bool has_head = stat(head, &st) == 0 && S_ISREG(st.st_mode);
+    free(head);
+    if (!has_head) { git_repo_free(repo); return NULL; }
     repo->valid = true;
-    repo->index_mtime = 0;
     repo->index_entries = NULL;
 
     // Parse git index
@@ -109,6 +144,7 @@ void git_repo_free(GitRepository *repo) {
     if (!repo) return;
 
     free(repo->repo_root);
+    free(repo->git_dir);
     if (repo->index_entries) {
         git_index_free(repo->index_entries);
     }

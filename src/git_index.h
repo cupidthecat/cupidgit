@@ -11,6 +11,9 @@
 typedef struct {
     time_t mtime_sec;
     uint32_t mtime_nsec;
+    uint32_t mode;
+    uint16_t flags;
+    uint16_t extended_flags;
     unsigned char sha1[GIT_SHA1_SIZE];
     char *path;  // Relative to repo root
 } GitIndexEntry;
@@ -24,6 +27,8 @@ typedef struct {
 
 // Parse .git/index file and populate repository
 bool git_index_parse(GitRepository *repo);
+
+bool git_index_refresh(GitRepository *repo);
 
 // Free index map
 void git_index_free(IndexMap *map);

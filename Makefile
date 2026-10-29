@@ -25,16 +25,26 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 # Build static library
-$(LIBRARY): $(OBJDIR) $(OBJECTS)
+$(LIBRARY): $(OBJECTS)
 	$(AR) $(ARFLAGS) $(LIBDIR)/$(LIBRARY) $(OBJECTS)
 	@echo "Built $(LIBRARY)"
 
 # Compile source files
-$(OBJDIR)/%.o: $(SRCDIR)/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 # Clean
 clean:
-	rm -rf $(OBJDIR) $(LIBRARY)
+	rm -rf $(OBJDIR) $(LIBRARY) tests/status_driver
 
 .PHONY: all clean
+
+-include $(OBJECTS:.o=.d)
+
+tests/status_driver: tests/status_driver.c $(LIBRARY) cupidgit.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. $< $(LIBRARY) $(LDFLAGS) $(LDLIBS) -o $@
+
+test: tests/status_driver
+	python3 tests/test_status.py
+
+.PHONY: test
