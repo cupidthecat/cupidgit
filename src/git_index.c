@@ -1,180 +1,147 @@
-#define _XOPEN_SOURCE 700
-#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
 #include "git_index.h"
+#include "sha1.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <limits.h>
+#include <errno.h>
+#include <stdint.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
-
-// Read 32-bit network byte order integer
-static uint32_t read_uint32(const unsigned char *data) {
-    return ntohl(*(uint32_t*)data);
+static uint32_t read_uint32(const unsigned char *p) {
+    return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3];
 }
-
 void git_index_free(IndexMap *map) {
     if (!map) return;
-
-    for (size_t i = 0; i < map->count; i++) {
-        free(map->entries[i].path);
-    }
-    free(map->entries);
-    free(map);
+    for (size_t i=0; i<map->count; i++) free(map->entries[i].path);
+    free(map->entries); free(map);
 }
-
-GitIndexEntry* git_index_lookup(IndexMap *map, const char *path) {
+GitIndexEntry *git_index_lookup(IndexMap *map, const char *path) {
     if (!map || !path) return NULL;
-
-    // Linear search (simple implementation)
-    for (size_t i = 0; i < map->count; i++) {
-        if (strcmp(map->entries[i].path, path) == 0) {
-            return &map->entries[i];
-        }
+    size_t lo=0, hi=map->count;
+    while (lo<hi) {
+        size_t mid=lo+(hi-lo)/2;
+        int cmp=strcmp(map->entries[mid].path,path);
+        if (cmp<0) lo=mid+1; else hi=mid;
     }
-
-    return NULL;
+    return lo<map->count && !strcmp(map->entries[lo].path,path) ? &map->entries[lo] : NULL;
 }
 
 bool git_index_parse(GitRepository *repo) {
-    if (!repo || !repo->repo_root) return false;
-
-    // Construct path to .git/index
-    char index_path[PATH_MAX];
-    snprintf(index_path, sizeof(index_path), "%s/.git/index", repo->repo_root);
-
-    // Open index file
-    int fd = open(index_path, O_RDONLY);
-    if (fd < 0) {
-        return false;
-    }
-
-    // Get file size
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        return false;
-    }
-
-    // Store index mtime for cache invalidation
-    repo->index_mtime = st.st_mtime;
-
-    // mmap the index file
-    unsigned char *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-
-    if (data == MAP_FAILED) {
-        return false;
-    }
-
-    // Verify signature "DIRC"
-    if (st.st_size < 12 || memcmp(data, "DIRC", 4) != 0) {
-        munmap(data, st.st_size);
-        return false;
-    }
-
-    // Read version and entry count
-    uint32_t version = read_uint32(data + 4);
-    uint32_t entry_count = read_uint32(data + 8);
-
-    // Support version 2, 3, 4
-    if (version < 2 || version > 4) {
-        munmap(data, st.st_size);
-        return false;
-    }
-
-    // Sanity check entry count
-    if (entry_count > 1000000) {
-        munmap(data, st.st_size);
-        return false;
-    }
-
-    // Allocate index map
-    IndexMap *map = calloc(1, sizeof(IndexMap));
-    if (!map) {
-        munmap(data, st.st_size);
-        return false;
-    }
-
-    map->entries = calloc(entry_count, sizeof(GitIndexEntry));
-    if (!map->entries) {
-        free(map);
-        munmap(data, st.st_size);
-        return false;
-    }
-
-    map->capacity = entry_count;
-
-    // Parse entries
-    const unsigned char *ptr = data + 12;
-    const unsigned char *end = data + st.st_size - 20;  // Exclude checksum
-
-    for (uint32_t i = 0; i < entry_count && ptr < end; i++) {
-        // Check we have at least 62 bytes for fixed fields
-        if (ptr + 62 > end) break;
-
-        GitIndexEntry *entry = &map->entries[map->count];
-
-        // Skip ctime (8 bytes)
-        ptr += 8;
-
-        // Read mtime (8 bytes)
-        entry->mtime_sec = read_uint32(ptr);
-        entry->mtime_nsec = read_uint32(ptr + 4);
-        ptr += 8;
-
-        // Skip dev, ino, mode, uid, gid, file_size (24 bytes)
-        ptr += 24;
-
-        // Read SHA-1 (20 bytes)
-        memcpy(entry->sha1, ptr, GIT_SHA1_SIZE);
-        ptr += GIT_SHA1_SIZE;
-
-        // Read flags (2 bytes)
-        uint16_t flags = (ptr[0] << 8) | ptr[1];
-        ptr += 2;
-
-        // Extract path length from flags (lower 12 bits)
-        uint16_t path_len = flags & 0x0FFF;
-
-        // Read path (variable length, null-terminated)
-        if (ptr + path_len > end) break;
-
-        entry->path = strndup((char*)ptr, path_len);
-        if (!entry->path) break;
-
-        if (i == 0) {
-            fprintf(stderr, "[DEBUG INDEX] First entry: flags=0x%04x, path_len=%u, path='%s'\n",
-                    flags, path_len, entry->path);
-        }
-
-        ptr += path_len;
-
-        // Skip null terminator
-        if (ptr < end && *ptr == '\0') ptr++;
-
-        // Align to 8-byte boundary
-        size_t entry_size = 62 + path_len + 1;
-        size_t padding = (8 - (entry_size % 8)) % 8;
-        ptr += padding;
-
-        map->count++;
-    }
-
-    munmap(data, st.st_size);
-
-    // Store index map in repository
-    if (repo->index_entries) {
+    if (!repo || !repo->git_dir) return false;
+    size_t n=strlen(repo->git_dir)+7;
+    char *path=malloc(n);
+    if (!path) return false;
+    snprintf(path,n,"%s/index",repo->git_dir);
+    FILE *fp=fopen(path,"rb");
+    int open_error=errno;
+    free(path);
+    IndexMap *map=calloc(1,sizeof(*map));
+    if (!map) { if(fp) fclose(fp); return false; }
+    if (!fp) {
+        if (open_error!=ENOENT) { free(map); return false; }
         git_index_free(repo->index_entries);
+        repo->index_entries=map;
+        repo->index_present=false;
+        return true;
     }
-    repo->index_entries = map;
+    struct stat st;
+    unsigned char *data=NULL;
+    bool ok=false;
+    if (fstat(fileno(fp),&st) || st.st_size<32 || (uintmax_t)st.st_size>SIZE_MAX) goto done;
+    size_t size=(size_t)st.st_size;
+    data=malloc(size);
+    if (!data || fread(data,1,size,fp)!=size) goto done;
+    if (memcmp(data,"DIRC",4)) goto done;
+    unsigned version=read_uint32(data+4), count=read_uint32(data+8);
+    if (version<2 || version>4 || count>1000000 || count>(size-32)/64) goto done;
+    SHA1_CTX ctx;
+    unsigned char digest[20];
+    SHA1_Init(&ctx); SHA1_Update(&ctx,data,size-20); SHA1_Final(digest,&ctx);
+    if (memcmp(digest,data+size-20,20)) goto done;
+    map->entries=calloc(count ? count : 1,sizeof(*map->entries));
+    if (!map->entries) goto done;
+    map->capacity=count;
+    size_t pos=12, end=size-20;
+    for (unsigned i=0;i<count;i++) {
+        size_t start=pos;
+        if (end-pos<62) goto done;
+        GitIndexEntry *entry=&map->entries[i];
+        entry->mtime_sec=read_uint32(data+pos+8);
+        entry->mtime_nsec=read_uint32(data+pos+12);
+        entry->mode=read_uint32(data+pos+24);
+        memcpy(entry->sha1,data+pos+40,20);
+        unsigned flags=(unsigned)data[pos+60]<<8 | data[pos+61];
+        entry->flags=(uint16_t)flags;
+        pos+=62;
+        if (flags&0x4000) {
+            if (version==2 || end-pos<2) goto done;
+            entry->extended_flags=(uint16_t)((unsigned)data[pos]<<8 | data[pos+1]);
+            if (entry->extended_flags & ~0x6000) goto done;
+            pos+=2;
+        }
+        size_t prefix=0;
+        if (version==4) {
+            size_t remove=0;
+            unsigned byte;
+            do {
+                if (pos==end || remove>(SIZE_MAX>>7)-1) goto done;
+                byte=data[pos++];
+                remove=(remove<<7)+(byte&127);
+                if(byte&128) remove++;
+            } while(byte&128);
+            size_t previous=i ? strlen(map->entries[i-1].path) : 0;
+            if(remove>previous) goto done;
+            prefix=previous-remove;
+        }
+        const unsigned char *nul=memchr(data+pos,0,end-pos);
+        if (!nul) goto done;
+        size_t suffix=(size_t)(nul-(data+pos));
+        if (prefix>SIZE_MAX-suffix-1) goto done;
+        size_t len=prefix+suffix;
+        if (!len || ((flags&4095)!=4095 && (flags&4095)!=len)) goto done;
+        entry->path=malloc(len+1);
+        if(!entry->path) goto done;
+        map->count++;
+        if(prefix) memcpy(entry->path,map->entries[i-1].path,prefix);
+        memcpy(entry->path+prefix,data+pos,suffix+1);
+        if (entry->path[0]=='/' || (i && strcmp(map->entries[i-1].path,entry->path)>0)) goto done;
+        pos+=(suffix+1);
+        if(version!=4) {
+            size_t pad=(8-(pos-start)%8)%8;
+            if(end-pos<pad) goto done;
+            for(size_t j=0;j<pad;j++) if(data[pos+j]) goto done;
+            pos+=pad;
+        }
+    }
+    while(pos<end) {
+        if(end-pos<8 || data[pos]<'A' || data[pos]>'Z') goto done;
+        size_t ext=read_uint32(data+pos+4);
+        pos+=8;
+        if(ext>end-pos) goto done;
+        pos+=ext;
+    }
+    git_index_free(repo->index_entries);
+    repo->index_entries=map;
+    repo->index_stat=st;
+    repo->index_present=true;
+    map=NULL; ok=true;
+done:
+    free(data); fclose(fp); git_index_free(map);
+    return ok;
+}
 
-    return true;
+bool git_index_refresh(GitRepository *repo) {
+    size_t n=strlen(repo->git_dir)+7;
+    char *path=malloc(n);
+    if(!path) return false;
+    snprintf(path,n,"%s/index",repo->git_dir);
+    struct stat st;
+    int rc=stat(path,&st), saved=errno;
+    free(path);
+    if(rc<0) return saved==ENOENT ? (!repo->index_present || git_index_parse(repo)) : false;
+    const struct stat *old=&repo->index_stat;
+    if(repo->index_present && st.st_ino==old->st_ino && st.st_size==old->st_size &&
+       st.st_mtim.tv_sec==old->st_mtim.tv_sec && st.st_mtim.tv_nsec==old->st_mtim.tv_nsec &&
+       st.st_ctim.tv_sec==old->st_ctim.tv_sec && st.st_ctim.tv_nsec==old->st_ctim.tv_nsec) return true;
+    return git_index_parse(repo);
 }
